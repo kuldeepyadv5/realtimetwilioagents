@@ -17,8 +17,11 @@ from typing import Any
 
 from fastapi import WebSocket
 from fastapi.websockets import WebSocketDisconnect
+from openai import AsyncOpenAI
 
+# openai_client = AsyncOpenAI()
 from agents import function_tool
+from agents import Agent, WebSearchTool,Runner
 from agents.realtime import (
     RealtimeAgent,
     RealtimePlaybackTracker,
@@ -28,8 +31,26 @@ from agents.realtime import (
 )
 
 @function_tool
-def get_weather(city: str) -> str:
-    return f"The weather in {city} is sunny."
+def web_search_tool(query: str) -> str:
+    print("\nquery",query)
+    from openai import OpenAI
+    client = OpenAI()
+    openai_client = OpenAI(api_key="")
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4o-search-preview",
+        web_search_options={},
+        messages=[
+            {
+                "role": "user",
+                "content": query,
+            }
+        ],
+    )
+
+    x=completion.choices[0].message.content
+    print("x",x)
+    return x
 
 @function_tool
 def get_current_time() -> str:
@@ -39,12 +60,15 @@ agent = RealtimeAgent(
     name="Twilio Assistant",
     instructions=(
         "You are a helpful voice assistant for phone conversations. "
-        "Always start with 'Hi Kuldeep, how are you?' when the conversation begins. "
+        "Say 'Hi, I am Kuldeep! How can I help you today?' at the beginning of every interaction. "
         "Listen carefully to the user's questions and provide clear, concise responses. "
         "Ask clarifying questions if needed, but keep the conversation flowing naturally. "
-        "Be conversational and engaging while staying focused on helping the user."
+        "Be conversational and engaging while staying focused on helping the user. "
+        "Always speak in English if the user asks a question. "
+        "If you need additional data, use the WebSearch tool."
+
     ),
-    tools=[get_weather, get_current_time],
+    tools=[web_search_tool, get_current_time],
 )
 
 class TwilioHandler:
@@ -126,6 +150,7 @@ class TwilioHandler:
         while True:
             try:
                 message = json.loads(await self.twilio_websocket.receive_text())
+                # print("\n _twilio_message_loop_message",message)
                 await self._handle_twilio_message(message)
             except WebSocketDisconnect:
                 break
@@ -139,12 +164,17 @@ class TwilioHandler:
         if event.type == "audio":
             if not self._stream_sid:
                 return
+
+            audio_size = len(event.audio.data)
+            # print(f"🎯 AI RESPONSE: Sending {audio_size} bytes of audio to user")
+
             b64 = base64.b64encode(event.audio.data).decode("utf-8")
             await self.twilio_websocket.send_text(json.dumps({
                 "event": "media",
                 "streamSid": self._stream_sid,
                 "media": {"payload": b64},
             }))
+
             # Optional mark so Twilio confirms when played
             self._mark_counter += 1
             await self.twilio_websocket.send_text(json.dumps({
@@ -152,24 +182,52 @@ class TwilioHandler:
                 "streamSid": self._stream_sid,
                 "mark": {"name": str(self._mark_counter)},
             }))
+
+            # print(f"✅ AI AUDIO SENT: {audio_size} bytes delivered to user")
         elif event.type == "audio_interrupted" and self._stream_sid:
+            print(f"🎵 AUDIO INTERRUPTED: Clearing audio stream")
             await self.twilio_websocket.send_text(json.dumps({
                 "event": "clear",
                 "streamSid": self._stream_sid
             }))
+        elif event.type == "response":
+            print(f"🤖 AI THINKING: Response started - processing user input")
+        elif event.type == "response_end":
+            print(f"🤖 AI FINISHED: Response completed")
+        elif event.type == "input_audio_buffer_speech_started":
+            print(f"👤 USER SPEAKING: Speech detected from user")
+        elif event.type == "input_audio_buffer_speech_ended":
+            print(f"👤 USER STOPPED: Speech ended, processing...")
+        elif event.type == "input_audio_buffer_committed":
+            print(f"📝 AUDIO PROCESSED: User speech committed for recognition")
+        elif event.type == "history_updated":
+            # print(f"📜 HISTORY UPDATED: {event.history}")
+            pass
+        else:
+            pass
+            # print(f"📋 OTHER EVENT: {event.type} - {getattr(event, 'data', 'N/A') if hasattr(event, 'data') else 'No data'}")
 
     async def _handle_twilio_message(self, message: dict[str, Any]) -> None:
         event = message.get("event")
         if event == "connected":
+            print(f"🔗 WEBSOCKET CONNECTED: Media stream connection established")
             return
         if event == "start":
             start = message.get("start", {})
-            # If server-level endpoint already set streamSid, keep it
-            self._stream_sid = self._stream_sid or start.get("streamSid")
+            stream_sid = start.get("streamSid")
+            self._stream_sid = self._stream_sid or stream_sid
+            print(f"🎬 STREAM STARTED: Stream SID = {self._stream_sid}")
             return
         if event == "media":
             await self._handle_media_event(message)
-        # mark/dtmf/stop can be ignored or logged
+        elif event == "mark":
+            mark = message.get("mark", {})
+            mark_name = mark.get("name", "")
+            print(f"📍 MARK RECEIVED: {mark_name} - Audio playback confirmed")
+        elif event == "stop":
+            print(f"🛑 STREAM STOPPED: Media stream ended")
+        else:
+            print(f"📨 TWILIO EVENT: {event} - {message}")
 
     async def _handle_media_event(self, message: dict[str, Any]) -> None:
         media = message.get("media", {})
@@ -178,11 +236,15 @@ class TwilioHandler:
             return
         try:
             ulaw_bytes = base64.b64decode(payload)
+            audio_size = len(ulaw_bytes)
+            # print(f"👤 USER INPUT: Received {audio_size} bytes of audio from user")
+
             self._audio_buffer.extend(ulaw_bytes)
             if len(self._audio_buffer) >= self.BUFFER_SIZE_BYTES:
+                # print(f"📤 SENDING TO AI: {len(self._audio_buffer)} bytes of user audio buffered and sent to OpenAI")
                 await self._flush_audio_buffer()
         except Exception as e:
-            print(f"Error processing inbound audio: {e}")
+            print(f"❌ Error processing inbound audio: {e}")
 
     async def _flush_audio_buffer(self) -> None:
         if not self._audio_buffer or not self.session:
@@ -191,9 +253,11 @@ class TwilioHandler:
         self._audio_buffer.clear()
         self._last_buffer_send_time = time.time()
         try:
+            # print(f"🤖 PROCESSING: Sending {len(data)} bytes to OpenAI for speech recognition")
             await self.session.send_audio(data)
+            # print(f"✅ AUDIO SENT TO AI: {len(data)} bytes processed by OpenAI")
         except Exception as e:
-            print(f"Error sending audio to OpenAI: {e}")
+            print(f"❌ Error sending audio to OpenAI: {e}")
 
     async def _buffer_flush_loop(self) -> None:
         while True:
