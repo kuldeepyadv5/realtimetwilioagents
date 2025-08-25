@@ -401,9 +401,13 @@ async def media_stream_endpoint(websocket: WebSocket):
                     if call_sid:
                         await manager.notify_media_stream_connected(call_sid)
 
-                    # Handler is now running and will take over the WebSocket
-                    # The media stream endpoint should exit and let the handler handle all subsequent messages
-                    print("Handler started, media stream endpoint exiting to let handler take over...")
+                    # Handler is now running - wait for it to complete
+                    # The handler will handle all subsequent WebSocket messages
+                    print("Handler started, waiting for conversation to complete...")
+
+                    # Wait for the handler to finish (this will block until the call ends)
+                    await handler.wait_until_done()
+                    print("Handler session completed normally")
                     return
 
             elif event == "media":

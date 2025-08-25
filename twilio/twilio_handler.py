@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
+import os ,sys
 import time
 from datetime import datetime
 from typing import Any
@@ -47,7 +47,7 @@ class TwilioHandler:
         self.playback_tracker = RealtimePlaybackTracker()
 
         # Audio buffering configuration (matching CLI demo)
-        self.CHUNK_LENGTH_S = 0.05  # 50ms chunks like CLI demo
+        self.CHUNK_LENGTH_S = 0.09  # 50ms chunks like CLI demo
         self.SAMPLE_RATE = 8000  # Twilio uses 8kHz for g711_ulaw
         self.BUFFER_SIZE_BYTES = int(self.SAMPLE_RATE * self.CHUNK_LENGTH_S)  # 50ms worth of audio
 
@@ -61,10 +61,15 @@ class TwilioHandler:
             str, tuple[str, int, int]
         ] = {}  # mark_id -> (item_id, content_index, byte_count)
 
+        # Track processed audio items to avoid duplicates
+        self._processed_audio_items: set[str] = set()
+
     async def start(self) -> None:
         """Start the session."""
+        # Clear any previous state
+        self._processed_audio_items.clear()
+
         runner = RealtimeRunner(agent)
-        api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
         print(f"Using OpenAI API key: {api_key[:20]}..." if api_key else "No API key found")
@@ -88,12 +93,8 @@ class TwilioHandler:
         await self.session.enter()
         print("Realtime session entered successfully")
 
-        # Check if WebSocket is already accepted (for outbound calls)
-        try:
-            await self.twilio_websocket.accept()
-            print("Twilio WebSocket connection accepted")
-        except Exception as e:
-            print(f"WebSocket already accepted or error: {e}")
+        # WebSocket should already be accepted by the media stream endpoint
+        print("Using existing WebSocket connection for Twilio handler")
 
         # Start all background tasks
         self._realtime_session_task = asyncio.create_task(self._realtime_session_loop())
@@ -187,12 +188,22 @@ class TwilioHandler:
                     if not message_text:
                         continue
                     message = json.loads(message_text)
+
+                    # Debug: Show incoming messages from Twilio
+                    event_type = message.get('event', 'unknown')
+                    if event_type == 'media':
+                        pass
+                        # print(f"📥 INCOMING: {event_type} - {len(message.get('media', {}).get('payload', ''))} bytes")
+                    else:
+                        print(f"📥 INCOMING: {event_type} - {message}")
+
                     await self._handle_twilio_message(message)
                 except json.JSONDecodeError as e:
                     print(f"Failed to parse Twilio message as JSON: {e}")
                     continue
                 except Exception as msg_error:
-                    print(f"Error processing Twilio message: {msg_error}")
+                    print(f"❌ Error processing Twilio message: {msg_error}")
+                    sys.exit()
                     # Continue processing other messages
                     continue
         except Exception as e:
@@ -202,8 +213,12 @@ class TwilioHandler:
     async def _handle_realtime_event(self, event: RealtimeSessionEvent) -> None:
         """Handle events from the realtime session."""
         try:
+            # print(f"\n🎯 EVENT TYPE: {event.type}")
             if event.type == "audio":
+                print(f"🎵 DIRECT AUDIO EVENT: Processing {len(event.audio.data)} bytes")
                 base64_audio = base64.b64encode(event.audio.data).decode("utf-8")
+                print(f"📤 Sending direct audio payload: {len(base64_audio)} chars")
+
                 await self.twilio_websocket.send_text(
                     json.dumps(
                         {
@@ -213,6 +228,7 @@ class TwilioHandler:
                         }
                     )
                 )
+                print("✅ Direct audio sent to Twilio")
 
                 # Send mark event for playback tracking
                 self._mark_counter += 1
@@ -250,6 +266,11 @@ class TwilioHandler:
                 print(f"AI response started: {event.response}")
             elif event.type == "response_end":
                 print("AI response completed")
+            elif event.type == "history_updated":
+                # Extract and display conversation text
+                await self._extract_conversation_text(event)
+                # Extract and play AI audio from conversation history
+                await self._handle_history_audio(event)
             else:
                 print(f"Unhandled event type: {event.type}")
         except Exception as e:
@@ -346,6 +367,196 @@ class TwilioHandler:
 
         except Exception as e:
             print(f"Error sending buffered audio to OpenAI: {e}")
+
+    async def _handle_history_audio(self, event) -> None:
+        """Extract and send AI audio from conversation history to Twilio."""
+        try:
+            if not hasattr(event, 'history') or not event.history:
+                return
+
+            # Track which item_ids we've already processed to avoid duplicates
+            # (Already initialized in constructor)
+
+            # Look for the most recent assistant message with audio
+            for item in reversed(event.history):
+                if hasattr(item, 'role') and item.role == 'assistant' and hasattr(item, 'content') and hasattr(item, 'item_id'):
+                    item_id = item.item_id
+
+                    # Skip if we've already processed this item's audio
+                    if item_id in self._processed_audio_items:
+                        continue
+
+                    for content_item in item.content:
+                        if hasattr(content_item, 'type') and content_item.type == 'audio' and hasattr(content_item, 'audio') and content_item.audio:
+                            # Found AI audio - send it to Twilio
+                            audio_data = content_item.audio
+                            print(f"🎵 Found AI audio data, type: {type(audio_data)}")
+
+                            if isinstance(audio_data, bytes):
+                                # Convert bytes to base64 for Twilio
+                                base64_audio = base64.b64encode(audio_data).decode("utf-8")
+                                print(f"📤 Sending {len(audio_data)} bytes of AI audio to Twilio")
+                            elif isinstance(audio_data, str):
+                                # Already base64 encoded - decode and re-encode to ensure proper format
+                                try:
+                                    # Decode base64 to verify it's valid, then re-encode
+                                    decoded_bytes = base64.b64decode(audio_data)
+                                    base64_audio = base64.b64encode(decoded_bytes).decode("utf-8")
+                                    print(f"📤 Re-encoded base64 AI audio to Twilio (original length: {len(audio_data)}, decoded bytes: {len(decoded_bytes)})")
+                                except Exception as decode_error:
+                                    print(f"❌ Error decoding base64 audio: {decode_error}")
+                                    continue
+                            else:
+                                print(f"❌ Unknown audio data type: {type(audio_data)}")
+                                continue
+
+                            try:
+                                # Send the audio in smaller chunks if it's very large
+                                chunk_size = 4000  # ~0.25 seconds of μ-law audio at 8kHz
+                                audio_bytes = base64.b64decode(base64_audio)
+
+                                print(f"🎵 Sending AI audio to Twilio: {len(audio_bytes)} bytes total")
+
+                                if len(audio_bytes) > chunk_size:
+                                    # Send in chunks
+                                    print(f"📦 Audio is large, sending in {chunk_size} byte chunks")
+                                    for i in range(0, len(audio_bytes), chunk_size):
+                                        chunk = audio_bytes[i:i + chunk_size]
+                                        chunk_base64 = base64.b64encode(chunk).decode("utf-8")
+
+                                        print(f"📤 Sending chunk {i//chunk_size + 1}: {len(chunk)} bytes")
+                                        await self.twilio_websocket.send_text(
+                                            json.dumps(
+                                                {
+                                                    "event": "media",
+                                                    "streamSid": self._stream_sid,
+                                                    "media": {"payload": chunk_base64},
+                                                }
+                                            )
+                                        )
+                                        await asyncio.sleep(0.001)  # Very small delay between chunks
+                                else:
+                                    # Send as single payload
+                                    print(f"📤 Sending audio as single payload: {len(audio_bytes)} bytes")
+                                    await self.twilio_websocket.send_text(
+                                        json.dumps(
+                                            {
+                                                "event": "media",
+                                                "streamSid": self._stream_sid,
+                                                "media": {"payload": base64_audio},
+                                            }
+                                        )
+                                    )
+
+                                # Send mark event for playback tracking
+                                self._mark_counter += 1
+                                mark_id = str(self._mark_counter)
+                                audio_bytes_len = len(audio_bytes)
+                                self._mark_data[mark_id] = (
+                                    item_id,
+                                    0,  # content_index
+                                    audio_bytes_len,  # byte_count
+                                )
+
+                                await self.twilio_websocket.send_text(
+                                    json.dumps(
+                                        {
+                                            "event": "mark",
+                                            "streamSid": self._stream_sid,
+                                            "mark": {"name": mark_id},
+                                        }
+                                    )
+                                )
+
+                                # Mark this item as processed
+                                self._processed_audio_items.add(item_id)
+
+                                print(f"✅ Successfully sent AI audio response to Twilio ({audio_bytes_len} bytes)")
+                                return  # Only send the most recent audio
+
+                            except Exception as send_error:
+                                print(f"❌ Error sending audio to Twilio: {send_error}")
+                                continue
+
+        except Exception as e:
+            print(f"❌ Error handling history audio: {e}")
+            # Fallback: try to extract text and use Twilio's text-to-speech
+            await self._fallback_text_to_speech(event)
+
+    async def _extract_conversation_text(self, event) -> None:
+        """Extract and display conversation text from history events."""
+        try:
+            if not hasattr(event, 'history') or not event.history:
+                return
+
+            print("\n📝 CONVERSATION UPDATE:")
+
+            for item in event.history:
+                if hasattr(item, 'role') and hasattr(item, 'content'):
+                    role = item.role
+                    content_list = item.content if hasattr(item, 'content') else []
+
+                    for content_item in content_list:
+                        if hasattr(content_item, 'type'):
+                            if content_item.type == 'text' and hasattr(content_item, 'text'):
+                                # Display text content
+                                if role == 'user':
+                                    print(f"👤 USER: '{content_item.text}'")
+                                elif role == 'assistant':
+                                    print(f"🤖 AI: '{content_item.text}'")
+
+                            elif content_item.type == 'input_audio' and hasattr(content_item, 'transcript'):
+                                # Display user speech transcription
+                                if content_item.transcript:
+                                    print(f"👤 USER (speech): '{content_item.transcript}'")
+
+                            elif content_item.type == 'audio' and hasattr(content_item, 'transcript'):
+                                # Display AI speech transcription
+                                if content_item.transcript:
+                                    print(f"🤖 AI (speech): '{content_item.transcript}'")
+
+        except Exception as e:
+            print(f"❌ Error extracting conversation text: {e}")
+
+    async def _fallback_text_to_speech(self, event) -> None:
+        """Fallback method to send a simple audio response to Twilio when AI audio extraction fails."""
+        try:
+            print("🔊 Fallback: Sending simple beep to Twilio")
+
+            # Send a simple beep sound (this is a minimal μ-law audio sample)
+            # This creates a short beep sound that the user will hear
+            beep_samples = 8000  # 1 second at 8kHz
+            beep_audio = bytearray()
+
+            # Generate a simple beep (sine wave at 800Hz)
+            import math
+            for i in range(beep_samples):
+                # Create a sine wave and convert to μ-law
+                sample = int(32767 * math.sin(2 * math.pi * 800 * i / 8000))
+                # Simple μ-law encoding (simplified)
+                if sample >= 0:
+                    ulaw_sample = 0xFF - sample // 128
+                else:
+                    ulaw_sample = 0x7F + (-sample) // 128
+                beep_audio.append(ulaw_sample)
+
+            # Send the beep audio to Twilio
+            beep_base64 = base64.b64encode(bytes(beep_audio)).decode("utf-8")
+
+            await self.twilio_websocket.send_text(
+                json.dumps(
+                    {
+                        "event": "media",
+                        "streamSid": self._stream_sid,
+                        "media": {"payload": beep_base64},
+                    }
+                )
+            )
+
+            print(f"✅ Sent fallback beep audio to Twilio ({len(beep_audio)} bytes)")
+
+        except Exception as e:
+            print(f"❌ Error in fallback audio: {e}")
 
     async def _buffer_flush_loop(self) -> None:
         """Periodically flush audio buffer to prevent stale data."""
