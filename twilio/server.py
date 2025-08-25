@@ -13,11 +13,6 @@ import json
 import os
 # from django.conf import settings
 
-
-os.environ["TWILIO_CALLER_ID"] = "(814) 831-8566"
-os.environ["PUBLIC_HOST"] = "https://b08ab791b0f3.ngrok-free.app"
-os.environ["PUBLIC_WSS"] = "wss://b08ab791b0f3.ngrok-free.app/ws/calling-by-no"
-
 # Import TwilioHandler class - handle both module and package use cases
 if TYPE_CHECKING:
     # For type checking, use the relative import
@@ -264,7 +259,9 @@ async def make_call_endpoint(request: Request):
 async def calling_websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for the calling interface."""
     await websocket.accept()
-    print("\nCalling interface WebSocket connected hii")
+    print("\nCalling interface WebSocket connected")
+
+    current_call_sid = None
 
     try:
         while True:
@@ -298,13 +295,24 @@ async def calling_websocket_endpoint(websocket: WebSocket):
                     await websocket.send_text(json.dumps(response))
 
             elif message.get('event') == 'stop':
-                # Handle call stop if needed
+                call_sid = message.get('call_sid')
+                if call_sid:
+                    # Handle call stop if needed
+                    print(f"Stopping call: {call_sid}")
+
                 response = {
                     'event': 'call_ended',
                     'message': 'Call ended by user'
                 }
                 await websocket.send_text(json.dumps(response))
 
+    except WebSocketDisconnect as e:
+        print(f"Calling interface WebSocket disconnected with code: {e.code}")
+        # Clean up the WebSocket registration
+        if current_call_sid:
+            manager.cleanup_call(current_call_sid)
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse message as JSON: {e}")
     except Exception as e:
         print(f"WebSocket error: {e}")
         import traceback
@@ -345,34 +353,44 @@ async def media_stream_endpoint(websocket: WebSocket):
                 print(f"Failed to parse message as JSON: {e}")
                 continue
 
-        event = message.get("event")
-        if event == "start":
-            start_data = message.get("start", {})
-            stream_sid = start_data.get("streamSid")
-            call_sid = start_data.get("callSid")
+            event = message.get("event")
 
-            print(f"Received start message: call_sid={call_sid}, stream_sid={stream_sid}")
+            if event == "connected":
+                print("Received connected event - media stream WebSocket connection established")
+                connected_received = True
+                # Send acknowledgment if needed
+                continue
 
-            # Check if this is for an outbound call
-            if call_sid and call_sid in manager.call_sessions:
-                # This is an outbound call - use existing handler if available
-                handler = manager.get_handler_for_call(call_sid)
-                if handler:
-                    print(f"Using existing handler for outbound call: {call_sid}")
-                    # Update the handler's websocket
-                    handler.twilio_websocket = websocket
+            elif event == "start":
+                if not connected_received:
+                    print("Warning: Received start event before connected event")
+
+                start_data = message.get("start", {})
+                stream_sid = start_data.get("streamSid")
+                call_sid = start_data.get("callSid")
+
+                print(f"Received start message: call_sid={call_sid}, stream_sid={stream_sid}")
+
+                # Check if this is for an outbound call
+                if call_sid and call_sid in manager.call_sessions:
+                    # This is an outbound call - use existing handler if available
+                    handler = manager.get_handler_for_call(call_sid)
+                    if handler:
+                        print(f"Using existing handler for outbound call: {call_sid}")
+                        # Update the handler's websocket
+                        handler.twilio_websocket = websocket
+                    else:
+                        print(f"Creating new handler for outbound call: {call_sid}")
+                        handler = await manager.new_session(websocket, call_sid)
                 else:
-                    print(f"Creating new handler for outbound call: {call_sid}")
+                    # This is an inbound call
+                    print("Creating handler for inbound call")
                     handler = await manager.new_session(websocket, call_sid)
-            else:
-                # This is an inbound call
-                print("Creating handler for inbound call")
-                handler = await manager.new_session(websocket, call_sid)
 
-            if handler:
-                # Register the handler for this stream
-                if stream_sid:
-                    manager.register_stream_handler(stream_sid, handler)
+                if handler:
+                    # Register the handler for this stream
+                    if stream_sid:
+                        manager.register_stream_handler(stream_sid, handler)
 
                     # Start the handler
                     print("Starting handler session...")
@@ -399,8 +417,8 @@ async def media_stream_endpoint(websocket: WebSocket):
             else:
                 print(f"Received unhandled event before start: {event}")
 
-    except WebSocketDisconnect:
-        print(f"WebSocket disconnected for call_sid={call_sid}, stream_sid={stream_sid}")
+    except WebSocketDisconnect as e:
+        print(f"WebSocket disconnected for call_sid={call_sid}, stream_sid={stream_sid} with code: {e.code}")
     except Exception as e:
         print(f"WebSocket error for call_sid={call_sid}, stream_sid={stream_sid}: {e}")
         import traceback
@@ -418,6 +436,6 @@ async def media_stream_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 3000))  # Changed default to 3000 to match ngrok
     uvicorn.run(app, host="0.0.0.0", port=port)
 # i am getting this error WebSocket error eee: (<CloseCode.NO_STATUS_RCVD: 1005>, '') and also we have to do converstion properloy  not we have to say one masage and liste the user input etc like we defin in the media_stream_endpoint 
