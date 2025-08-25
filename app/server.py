@@ -163,4 +163,5 @@ if __name__ == "__main__":
     print("hii")
     # C:\Users\kulde\OneDrive\Desktop\LLM\realtime\app\server.py
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 3000))  # Changed to 3000 to match ngrok
+    uvicorn.run(app, host="0.0.0.0", port=port)

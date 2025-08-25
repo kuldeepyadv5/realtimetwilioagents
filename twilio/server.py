@@ -37,6 +37,7 @@ class TwilioWebSocketManager:
         self.active_handlers: dict[str, TwilioHandler] = {}  # stream_sid -> handler
         self.pending_handlers: dict[str, TwilioHandler] = {}  # call_sid -> handler (for outbound calls)
         self.call_sessions: dict[str, dict] = {}  # Track call states
+        self.calling_websockets: dict[str, WebSocket] = {}  # call_sid -> calling interface websocket
 
     async def new_session(self, websocket: WebSocket, call_sid: str = None) -> TwilioHandler:
         """Create and configure a new session."""
@@ -62,6 +63,11 @@ class TwilioWebSocketManager:
         self.active_handlers[stream_sid] = handler
         print(f"Registered handler for stream: {stream_sid}")
 
+    def register_calling_websocket(self, call_sid: str, websocket: WebSocket):
+        """Register the calling interface WebSocket for a call."""
+        self.calling_websockets[call_sid] = websocket
+        print(f"Registered calling WebSocket for call: {call_sid}")
+
     def cleanup_call(self, call_sid: str, stream_sid: str = None):
         """Clean up handlers for a call."""
         if call_sid in self.pending_handlers:
@@ -72,9 +78,28 @@ class TwilioWebSocketManager:
             del self.active_handlers[stream_sid]
             print(f"Cleaned up active handler for stream: {stream_sid}")
 
+        if call_sid in self.calling_websockets:
+            del self.calling_websockets[call_sid]
+            print(f"Cleaned up calling WebSocket for call: {call_sid}")
+
         if call_sid in self.call_sessions:
             del self.call_sessions[call_sid]
             print(f"Cleaned up call session: {call_sid}")
+
+    async def notify_media_stream_connected(self, call_sid: str):
+        """Notify the calling interface that media stream is connected."""
+        if call_sid in self.calling_websockets:
+            websocket = self.calling_websockets[call_sid]
+            try:
+                response = {
+                    'event': 'media_stream_connected',
+                    'call_sid': call_sid,
+                    'message': 'Media stream connected - ready for conversation'
+                }
+                await websocket.send_text(json.dumps(response))
+                print(f"Notified calling interface of media stream connection for call: {call_sid}")
+            except Exception as e:
+                print(f"Error notifying calling interface: {e}")
 
     def get_twilio_client(self):
         """Get Twilio client instance."""
@@ -104,7 +129,7 @@ class TwilioWebSocketManager:
 
             print(f"Making outbound call from {caller_id} to {phone_number}")
 
-            # Create TwiML for outbound call
+            # Create TwiML for outbound call - connect immediately to media stream
             twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
             <Response>
                 <Say>hii kuldeep how are you</Say>
@@ -245,18 +270,30 @@ async def calling_websocket_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_text()
             message = json.loads(data)
-            print("\n\n message",message)
+            print(f"\nReceived message: {message}")
 
             if message.get('event') == 'start':
                 phone_number = message.get('phoneNumber')
                 if phone_number:
+                    print(f"Initiating call to: {phone_number}")
                     result = await manager.make_outbound_call(phone_number)
-                    print("\n hii_result",result)
-                    response = {
-                        'event': 'call_placed',
-                        'call_sid': result.get('call_sid'),
-                        'message': result.get('message', 'Call initiated')
-                    }
+                    print(f"Call result: {result}")
+
+                    if result.get('success'):
+                        current_call_sid = result.get('call_sid')
+                        # Register this WebSocket for the call
+                        manager.register_calling_websocket(current_call_sid, websocket)
+
+                        response = {
+                            'event': 'call_placed',
+                            'call_sid': current_call_sid,
+                            'message': result.get('message', 'Call initiated')
+                        }
+                    else:
+                        response = {
+                            'event': 'call_error',
+                            'message': result.get('error', 'Failed to place call')
+                        }
 
                     await websocket.send_text(json.dumps(response))
 
@@ -269,7 +306,12 @@ async def calling_websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps(response))
 
     except Exception as e:
-        print(f"WebSocket error eee: {e}")
+        print(f"WebSocket error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Clean up the WebSocket registration
+        if current_call_sid:
+            manager.cleanup_call(current_call_sid)
 
     print("Calling interface WebSocket disconnected")
 
@@ -286,18 +328,22 @@ async def media_stream_endpoint(websocket: WebSocket):
     try:
         # Accept the WebSocket connection
         await websocket.accept()
-        print("Media stream WebSocket accepted, waiting for start message...")
+        print("Media stream WebSocket accepted, waiting for messages...")
 
-        # Receive the first message to get call/stream info
-        try:
-            message_text = await websocket.receive_text()
-            message = json.loads(message_text)
-        except asyncio.TimeoutError:
-            print("Timeout waiting for initial message")
-            return
-        except json.JSONDecodeError as e:
-            print(f"Failed to parse initial message as JSON: {e}")
-            return
+        connected_received = False
+
+        while True:
+            # Receive messages in a loop
+            try:
+                message_text = await websocket.receive_text()
+                message = json.loads(message_text)
+                print(f"media_stream_endpoint message received: {message}")
+            except asyncio.TimeoutError:
+                print("Timeout waiting for message")
+                continue
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse message as JSON: {e}")
+                continue
 
         event = message.get("event")
         if event == "start":
@@ -328,15 +374,30 @@ async def media_stream_endpoint(websocket: WebSocket):
                 if stream_sid:
                     manager.register_stream_handler(stream_sid, handler)
 
-                # Start the handler
-                print("Starting handler session...")
-                await handler.start()
-                print("Handler started, waiting for completion...")
-                await handler.wait_until_done()
-                print("Handler session completed")
+                    # Start the handler
+                    print("Starting handler session...")
+                    await handler.start()
+                    print("Handler started successfully")
 
-        else:
-            print(f"Unexpected first message event: {event}")
+                    # Notify the calling interface that media stream is connected
+                    if call_sid:
+                        await manager.notify_media_stream_connected(call_sid)
+
+                    # Handler is now running and will take over the WebSocket
+                    # The media stream endpoint should exit and let the handler handle all subsequent messages
+                    print("Handler started, media stream endpoint exiting to let handler take over...")
+                    return
+
+            elif event == "media":
+                # If we receive media before start, something is wrong
+                print("Warning: Received media message before start event - this shouldn't happen")
+
+            elif event == "stop" or event == "mark":
+                # If we receive other events before start, log them
+                print(f"Received {event} event before start - ignoring")
+
+            else:
+                print(f"Received unhandled event before start: {event}")
 
     except WebSocketDisconnect:
         print(f"WebSocket disconnected for call_sid={call_sid}, stream_sid={stream_sid}")

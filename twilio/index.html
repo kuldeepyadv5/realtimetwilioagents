@@ -290,7 +290,7 @@
                 </div>
                 <div class="form-group">
                     <label for="wsUrl">WebSocket URL:</label>
-                    <input type="text" id="wsUrl" value="ws://localhost:8000/ws/calling-by-no" placeholder="WebSocket URL" readonly>
+                    <input type="text" id="wsUrl" value="ws://localhost:3000/ws/calling-by-no" placeholder="WebSocket URL" readonly>
                 </div>
                 <div style="text-align: center;">
                     <button class="btn btn-success" onclick="connectWebSocket()" id="connectBtn">Connect</button>
@@ -472,10 +472,14 @@
                             handleCallPlaced(data);
                         } else if (data.event === 'call_connected') {
                             handleCallConnected(data);
+                        } else if (data.event === 'media_stream_connected') {
+                            handleMediaStreamConnected(data);
                         } else if (data.event === 'call_disconnected') {
                             handleCallDisconnected(data);
                         } else if (data.event === 'call_ended') {
                             handleCallEnded(data);
+                        } else if (data.event === 'call_error') {
+                            handleCallError(data);
                         } else if (data.event === 'error') {
                             handleCallError(data);
                         } else if (data.event === 'mute_status') {
@@ -661,6 +665,16 @@
             updateButtonStates();
         }
 
+        // Handle media stream connected
+        function handleMediaStreamConnected(data) {
+            log(`Media stream connected successfully. Call SID: ${data.call_sid}`, 'success');
+            updateCallStatus('Connected - Ready for conversation');
+            updateButtonStates();
+            // Start the call timer when media stream is connected
+            callStartTime = Date.now();
+            callTimer = setInterval(updateCallDuration, 1000);
+        }
+
         // Handle call disconnected
         function handleCallDisconnected(data) {
             log(`Call disconnected. Call SID: ${data.call_sid}`, 'message');
@@ -678,6 +692,13 @@
                 clearInterval(callTimer);
                 callTimer = null;
             }
+        }
+
+        // Handle call placed (new function for better status tracking)
+        function handleCallPlaced(data) {
+            log(`Call placed successfully. Call SID: ${data.call_sid}`, 'success');
+            updateCallStatus('Calling...');
+            updateButtonStates();
         }
 
         // Handle mute status

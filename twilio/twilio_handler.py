@@ -34,7 +34,7 @@ def get_current_time() -> str:
 
 agent = RealtimeAgent(
     name="Twilio Assistant",
-    instructions="You are a helpful voice assistant for phone conversations. Always start with a brief, friendly greeting when the conversation begins. Listen carefully to the user's questions and provide clear, concise responses. Ask clarifying questions if needed, but keep the conversation flowing naturally. Be conversational and engaging while staying focused on helping the user.",
+    instructions="You are a helpful voice assistant for phone conversations. Always start with 'Hi Kuldeep, how are you?' when the conversation begins. Listen carefully to the user's questions and provide clear, concise responses. Ask clarifying questions if needed, but keep the conversation flowing naturally. Be conversational and engaging while staying focused on helping the user.",
     tools=[get_weather, get_current_time],
 )
 
@@ -67,7 +67,7 @@ class TwilioHandler:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required")
-        print("\n\napi_key", api_key[:20] + "..." if api_key else "None")
+        print(f"Using OpenAI API key: {api_key[:20]}..." if api_key else "No API key found")
         self.session = await runner.run(
             model_config={
                 "api_key": api_key,
@@ -79,12 +79,14 @@ class TwilioHandler:
                         "interrupt_response": True,
                         "create_response": True,
                     },
+                    "instructions": "You are a helpful voice assistant for phone conversations. Always start with 'Hi Kuldeep, how are you?' when the conversation begins. Listen carefully to the user's questions and provide clear, concise responses. Ask clarifying questions if needed, but keep the conversation flowing naturally. Be conversational and engaging while staying focused on helping the user.",
                 },
                 "playback_tracker": self.playback_tracker,
             }
         )
 
         await self.session.enter()
+        print("Realtime session entered successfully")
 
         # Check if WebSocket is already accepted (for outbound calls)
         try:
@@ -98,6 +100,8 @@ class TwilioHandler:
         self._message_loop_task = asyncio.create_task(self._twilio_message_loop())
         self._buffer_flush_task = asyncio.create_task(self._buffer_flush_loop())
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+        print("All background tasks started")
 
     async def wait_until_done(self) -> None:
         """Wait until the session is done."""
@@ -142,10 +146,11 @@ class TwilioHandler:
         """Send periodic keepalive messages to maintain WebSocket connection."""
         try:
             while True:
-                await asyncio.sleep(30)  # Send keepalive every 30 seconds
+                await asyncio.sleep(20)  # Send keepalive every 20 seconds
                 try:
                     # Send a simple keepalive message
                     await self.twilio_websocket.send_text(json.dumps({"event": "keepalive"}))
+                    print("Keepalive sent")
                 except Exception as e:
                     print(f"Error sending keepalive: {e}")
                     break
@@ -259,14 +264,24 @@ class TwilioHandler:
                 print("Twilio media stream connected")
             elif event == "start":
                 start_data = message.get("start", {})
-                self._stream_sid = start_data.get("streamSid")
-                print(f"Media stream started with SID: {self._stream_sid}")
+                stream_sid = start_data.get("streamSid")
+                if not self._stream_sid:
+                    self._stream_sid = stream_sid
+                    print(f"Media stream started with SID: {self._stream_sid}")
+                    # Send a small amount of silence to initialize the audio stream
+                    await asyncio.sleep(0.1)
+                    # Notify that media stream is ready for conversation
+                    print("Media stream ready for conversation")
+                else:
+                    print(f"Media stream start event received again for SID: {stream_sid} (already initialized)")
             elif event == "media":
                 await self._handle_media_event(message)
             elif event == "mark":
                 await self._handle_mark_event(message)
             elif event == "stop":
                 print("Media stream stopped")
+            elif event == "keepalive":
+                print("Received keepalive from Twilio")
         except Exception as e:
             print(f"Error handling Twilio message: {e}")
 
