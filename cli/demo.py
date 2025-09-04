@@ -1,250 +1,296 @@
 import asyncio
+import os
 import queue
 import sys
 import threading
-from typing import Any
-import os
-# from django.conf import settings
+from typing import Any, Optional
 
-os.environ["OPENAI_API_KEY"] =""
 import numpy as np
 import sounddevice as sd
 
-from agents import function_tool
-from agents.realtime import RealtimeAgent, RealtimeRunner, RealtimeSession, RealtimeSessionEvent
+from news_agent import get_starting_agent
+from agents.realtime import (
+    RealtimeAgent,
+    RealtimeRunner,
+    RealtimeSession,
+    RealtimeSessionEvent,
+)
 
-# Audio configuration
-CHUNK_LENGTH_S = 0.05  # 50ms
-SAMPLE_RATE = 24000
+# =========================
+# Audio / Buffer Settings
+# =========================
+CHUNK_LENGTH_S = 0.02        # 20 ms frames (telephony/WebRTC standard)
+SAMPLE_RATE = 24000          # Use 16000 for best ASR alignment; switch to 24000 if your server requires it
 FORMAT = np.int16
 CHANNELS = 1
 
-# Set up logging for OpenAI agents SDK
-# logging.basicConfig(
-#     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-# )
-# logger.logger.setLevel(logging.ERROR)
+# Playback robustness
+PREROLL_CHUNKS = 8           # Wait until we have ~160 ms of audio before starting playback
+MAX_QUEUE = 128              # Jitter buffer depth (input to speaker)
 
-
-@function_tool
-def get_weather(city: str) -> str:
-    """Get the weather in a city."""
-    return f"The weather in {city} is sunny."
-
-
-agent = RealtimeAgent(
-    name="Assistant",
-    instructions="You always greet the user with 'Top of the morning to you'.",
-    tools=[get_weather],
-)
+# =========================
+# Security: API key via env
+# =========================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    # Fail early & loudly; do NOT hardcode keys
+    raise RuntimeError("OPENAI_API_KEY is not set in environment")
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 
 def _truncate_str(s: str, max_length: int) -> str:
-    if len(s) > max_length:
-        return s[:max_length] + "..."
-    return s
+    return s if len(s) <= max_length else s[:max_length] + "..."
 
 
 class NoUIDemo:
+    """
+    Robust full-duplex(ish) audio client with half-duplex gating to prevent overlap.
+    - Callback mic input -> thread-safe send to session
+    - Output callback pulls from jitter buffer with preroll
+    """
+
     def __init__(self) -> None:
-        self.session: RealtimeSession | None = None
-        self.audio_stream: sd.InputStream | None = None
-        self.audio_player: sd.OutputStream | None = None
-        self.recording = False
+        # Realtime session
+        self.session: Optional[RealtimeSession] = None
+        self.runner: Optional[RealtimeRunner] = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Audio output state for callback system
-        self.output_queue: queue.Queue[Any] = queue.Queue(maxsize=10)  # Buffer more chunks
+        # Sounddevice streams
+        self.audio_in: Optional[sd.InputStream] = None
+        self.audio_out: Optional[sd.OutputStream] = None
+
+        # Output state
+        self.output_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=MAX_QUEUE)
+        self.current_audio_chunk: Optional[np.ndarray] = None
+        self.chunk_position: int = 0
         self.interrupt_event = threading.Event()
-        self.current_audio_chunk: np.ndarray | None = None  # type: ignore
-        self.chunk_position = 0
+        self.ready_to_play = False  # wait for preroll before unmuting output
 
+        # Half-duplex gating to avoid the agent hearing its own TTS
+        self.is_playing_tts = False
+        self.block_mic = False
+
+        # Derived constants
+        self.blocksize = int(SAMPLE_RATE * CHUNK_LENGTH_S)  # samples per frame (e.g., 320 at 16k/20ms)
+
+    # =========================
+    # Output (speaker) callback
+    # =========================
     def _output_callback(self, outdata, frames: int, time, status) -> None:
-        """Callback for audio output - handles continuous audio stream from server."""
         if status:
-            print(f"Output callback status: {status}")
+            # print(f"[Output] {status}")  # Uncomment for debugging
+            pass
 
-        # Check if we should clear the queue due to interrupt
+        # On explicit interrupt: flush buffer and reset positions
         if self.interrupt_event.is_set():
-            # Clear the queue and current chunk state
-            while not self.output_queue.empty():
-                try:
-                    self.output_queue.get_nowait()
-                except queue.Empty:
-                    break
+            with self.output_queue.mutex:
+                self.output_queue.queue.clear()
             self.current_audio_chunk = None
             self.chunk_position = 0
             self.interrupt_event.clear()
+            self.ready_to_play = False  # re-preroll on next utterance
             outdata.fill(0)
             return
 
-        # Fill output buffer from queue and current chunk
-        outdata.fill(0)  # Start with silence
+        # Honor preroll: keep silence until we have enough buffered audio
+        if not self.ready_to_play:
+            # If we have enough in queue, flip the flag
+            if self.output_queue.qsize() >= PREROLL_CHUNKS:
+                self.ready_to_play = True
+            else:
+                outdata.fill(0)
+                return
+
+        # Normal playback
+        outdata.fill(0)
+        buf = outdata[:, 0]  # mono view
         samples_filled = 0
 
-        while samples_filled < len(outdata):
-            # If we don't have a current chunk, try to get one from queue
+        while samples_filled < frames:
             if self.current_audio_chunk is None:
                 try:
                     self.current_audio_chunk = self.output_queue.get_nowait()
                     self.chunk_position = 0
                 except queue.Empty:
-                    # No more audio data available - this causes choppiness
-                    # Uncomment next line to debug underruns:
-                    # print(f"Audio underrun: {samples_filled}/{len(outdata)} samples filled")
+                    # Underrun — keep remaining as silence
                     break
 
-            # Copy data from current chunk to output buffer
-            remaining_output = len(outdata) - samples_filled
+            remaining_out = frames - samples_filled
             remaining_chunk = len(self.current_audio_chunk) - self.chunk_position
-            samples_to_copy = min(remaining_output, remaining_chunk)
+            n = min(remaining_out, remaining_chunk)
+            if n > 0:
+                start_o = samples_filled
+                end_o = samples_filled + n
+                start_c = self.chunk_position
+                end_c = self.chunk_position + n
+                buf[start_o:end_o] = self.current_audio_chunk[start_c:end_c]
+                samples_filled += n
+                self.chunk_position += n
 
-            if samples_to_copy > 0:
-                chunk_data = self.current_audio_chunk[
-                    self.chunk_position : self.chunk_position + samples_to_copy
-                ]
-                # More efficient: direct assignment for mono audio instead of reshape
-                outdata[samples_filled : samples_filled + samples_to_copy, 0] = chunk_data
-                samples_filled += samples_to_copy
-                self.chunk_position += samples_to_copy
+            if self.chunk_position >= len(self.current_audio_chunk):
+                self.current_audio_chunk = None
+                self.chunk_position = 0
 
-                # If we've used up the entire chunk, reset for next iteration
-                if self.chunk_position >= len(self.current_audio_chunk):
-                    self.current_audio_chunk = None
-                    self.chunk_position = 0
+    # =========================
+    # Input (mic) callback
+    # =========================
+    def _input_callback(self, indata, frames: int, time, status) -> None:
+        if status:
+            # print(f"[Input] {status}")  # Uncomment for debugging
+            pass
 
+        # Half-duplex: while TTS is playing, suppress mic to avoid feedback/overlap
+        if self.block_mic or self.is_playing_tts:
+            return
+
+        if not self.session or not self.loop:
+            return
+
+        try:
+            # Ensure int16 mono bytes
+            mono = indata[:, 0] if indata.ndim > 1 else indata
+            if mono.dtype != np.int16:
+                # Cast defensively if device returns float32
+                mono = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
+            audio_bytes = mono.tobytes()
+
+            # Send to session from callback thread
+            asyncio.run_coroutine_threadsafe(self.session.send_audio(audio_bytes), self.loop)
+        except Exception:
+            pass
+
+    # =========================
+    # Main run
+    # =========================
     async def run(self) -> None:
-        print("Connecting, may take a few seconds...")
+        print("Connecting…")
 
-        # Initialize audio player with callback
-        chunk_size = int(SAMPLE_RATE * CHUNK_LENGTH_S)
-        self.audio_player = sd.OutputStream(
+        # Save loop for thread-safe sends
+        self.loop = asyncio.get_running_loop()
+
+        # Prepare audio output
+        self.audio_out = sd.OutputStream(
             channels=CHANNELS,
             samplerate=SAMPLE_RATE,
             dtype=FORMAT,
+            blocksize=self.blocksize,
+            latency="low",
             callback=self._output_callback,
-            blocksize=chunk_size,  # Match our chunk timing for better alignment
         )
-        self.audio_player.start()
+        self.audio_out.start()
 
         try:
-            runner = RealtimeRunner(agent)
-            async with await runner.run() as session:
+            agent = get_starting_agent()
+            self.runner = RealtimeRunner(agent)
+
+            async with await self.runner.run() as session:
                 self.session = session
-                print("Connected. Starting audio recording...")
+                print("Connected. Starting mic…")
 
-                # Start audio recording
-                await self.start_audio_recording()
-                print("Audio recording started. You can start speaking - expect lots of logs!")
+                # Start mic with callback
+                self.audio_in = sd.InputStream(
+                    channels=CHANNELS,
+                    samplerate=SAMPLE_RATE,
+                    dtype=FORMAT,
+                    blocksize=self.blocksize,
+                    latency="low",
+                    callback=self._input_callback,
+                )
+                self.audio_in.start()
 
-                # Process session events
+                print("Live. Speak when ready. (Half-duplex: mic mutes during TTS)")
+
+                # Consume session events
                 async for event in session:
                     await self._on_event(event)
 
         finally:
-            # Clean up audio player
-            if self.audio_player and self.audio_player.active:
-                self.audio_player.stop()
-            if self.audio_player:
-                self.audio_player.close()
+            # Clean up audio
+            try:
+                if self.audio_in and self.audio_in.active:
+                    self.audio_in.stop()
+                if self.audio_in:
+                    self.audio_in.close()
+            except Exception:
+                pass
 
-        print("Session ended")
+            try:
+                if self.audio_out and self.audio_out.active:
+                    self.audio_out.stop()
+                if self.audio_out:
+                    self.audio_out.close()
+            except Exception:
+                pass
 
-    async def start_audio_recording(self) -> None:
-        """Start recording audio from the microphone."""
-        # Set up audio input stream
-        self.audio_stream = sd.InputStream(
-            channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
-            dtype=FORMAT,
-        )
+            print("Session ended")
 
-        self.audio_stream.start()
-        self.recording = True
-
-        # Start audio capture task
-        asyncio.create_task(self.capture_audio())
-
-    async def capture_audio(self) -> None:
-        """Capture audio from the microphone and send to the session."""
-        if not self.audio_stream or not self.session:
-            return
-
-        # Buffer size in samples
-        read_size = int(SAMPLE_RATE * CHUNK_LENGTH_S)
-
-        try:
-            while self.recording:
-                # Check if there's enough data to read
-                if self.audio_stream.read_available < read_size:
-                    await asyncio.sleep(0.01)
-                    continue
-
-                # Read audio data
-                data, _ = self.audio_stream.read(read_size)
-
-                # Convert numpy array to bytes
-                audio_bytes = data.tobytes()
-
-                # Send audio to session
-                await self.session.send_audio(audio_bytes)
-
-                # Yield control back to event loop
-                await asyncio.sleep(0)
-
-        except Exception as e:
-            print(f"Audio capture error: {e}")
-        finally:
-            if self.audio_stream and self.audio_stream.active:
-                self.audio_stream.stop()
-            if self.audio_stream:
-                self.audio_stream.close()
-
+    # =========================
+    # Event handling
+    # =========================
     async def _on_event(self, event: RealtimeSessionEvent) -> None:
-        """Handle session events."""
         try:
-            if event.type == "agent_start":
-                print(f"Agent started: {event.agent.name}")
-            elif event.type == "agent_end":
-                print(f"Agent ended: {event.agent.name}")
-            elif event.type == "handoff":
-                print(f"Handoff from {event.from_agent.name} to {event.to_agent.name}")
-            elif event.type == "tool_start":
-                print(f"Tool started: {event.tool.name}")
-            elif event.type == "tool_end":
-                print(f"Tool ended: {event.tool.name}; output: {event.output}")
-            elif event.type == "audio_end":
-                print("Audio ended")
-            elif event.type == "audio":
-                # Enqueue audio for callback-based playback
+            etype = event.type
+
+            if etype == "agent_start":
+                # New utterance starting soon: prep state
+                self.is_playing_tts = True
+                self.block_mic = True   # pause mic while TTS streams
+                # Do NOT clear queue yet; we need preroll
+
+            elif etype == "audio":
+                # Queue TTS audio; do not drop unless we're deeply backed up
                 np_audio = np.frombuffer(event.audio.data, dtype=np.int16)
+
                 try:
                     self.output_queue.put_nowait(np_audio)
                 except queue.Full:
-                    # Queue is full - only drop if we have significant backlog
-                    # This prevents aggressive dropping that could cause choppiness
-                    if self.output_queue.qsize() > 8:  # Keep some buffer
-                        try:
-                            self.output_queue.get_nowait()
-                            self.output_queue.put_nowait(np_audio)
-                        except queue.Empty:
-                            pass
-                    # If queue isn't too full, just skip this chunk to avoid blocking
-            elif event.type == "audio_interrupted":
-                print("Audio interrupted")
-                # Signal the output callback to clear its queue and state
+                    # Drop oldest to keep most recent flowing
+                    try:
+                        _ = self.output_queue.get_nowait()
+                        self.output_queue.put_nowait(np_audio)
+                    except queue.Empty:
+                        pass
+
+                # When enough buffered, allow playback to start
+                if not self.ready_to_play and self.output_queue.qsize() >= PREROLL_CHUNKS:
+                    self.ready_to_play = True
+
+            elif etype == "audio_end":
+                # End of this TTS segment
+                self.is_playing_tts = False
+                self.block_mic = False
+                # Let any residual buffered audio drain naturally; next utterance will re-preroll
+
+            elif etype == "audio_interrupted":
+                # Interrupt current audio; clear output immediately
+                self.is_playing_tts = False
+                self.block_mic = False
                 self.interrupt_event.set()
-            elif event.type == "error":
-                print(f"Error: {event.error}")
-            elif event.type == "history_updated":
-                pass  # Skip these frequent events
-            elif event.type == "history_added":
-                pass  # Skip these frequent events
-            elif event.type == "raw_model_event":
-                print(f"Raw model event: {_truncate_str(str(event.data), 50)}")
+
+            elif etype == "tool_start":
+                pass
+            elif etype == "tool_end":
+                pass
+            elif etype == "handoff":
+                pass
+            elif etype == "history_updated":
+                pass
+            elif etype == "history_added":
+                pass
+            elif etype == "raw_model_event":
+                # Debug hook
+                # print(f"Raw: {_truncate_str(str(event.data), 120)}")
+                pass
+            elif etype == "error":
+                print(f"[Error] {event.error}")
+            elif etype == "agent_end":
+                pass
             else:
-                print(f"Unknown event type: {event.type}")
+                # print(f"[Info] Unknown event: {etype}")
+                pass
+
         except Exception as e:
-            print(f"Error processing event: {_truncate_str(str(e), 50)}")
+            print(f"[Event Error] {_truncate_str(str(e), 200)}")
 
 
 if __name__ == "__main__":
@@ -252,8 +298,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(demo.run())
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\nExiting…")
         sys.exit(0)
-# python agentvoice/streamed/main.py
-# python examples/realtime/cli/demo.py
-# python examples/realtime/cli/ui.py

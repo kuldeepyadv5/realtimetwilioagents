@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, assert_never
 import os
 # from django.conf import settings
 
-os.environ["OPENAI_API_KEY"] =  " "
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -152,16 +151,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 
-@app.get("/")
+@app.get("/ss")
 async def read_index():
+    print("in the read")
     return FileResponse("static/index.html")
 
 
 if __name__ == "__main__":
+    # import uvicorn
+    # print("hii")
+    # port = int(os.getenv("PORT", 8000))
+    # uvicorn.run(app, host="0.0.0.0", port=port, reload=True)  
     import uvicorn
-    # python app/server.py
     print("hii")
-    # C:\Users\kulde\OneDrive\Desktop\LLM\realtime\app\server.py
-
-    port = int(os.getenv("PORT", 3000))  # Changed to 3000 to match ngrok
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=True)
